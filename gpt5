@@ -1,69 +1,271 @@
 #!/usr/bin/env python3
-import argparse, json, os, sys, time
+# -*- coding: utf-8 -*-
+"""
+gpt5: WSL向け GPT-5 CLI
+- Web検索統合（tools:web_search）
+- 履歴保存（擬似スレッド）
+- スレッド一覧/履歴表示
+- 追加: エクスポート(--export markdown/json), grep検索(--grep), デフォルトスレッド切替(--set-thread/--get-thread)
+"""
+
+import argparse, json, os, sys, time, glob, datetime, re
 import requests
 from pathlib import Path
 
 API_URL = "https://api.openai.com/v1/responses"
-MODEL   = "gpt-5"  # gpt-5 / gpt-5-mini 等も可
+MODEL   = "gpt-5"   # gpt-5 / gpt-5-mini など
+BASE_DIR = os.path.expanduser("~/.gpt5_cli")
+CONFIG   = Path(BASE_DIR) / "config.json"
 
-def load_history(dirpath, session):
-    path = Path(dirpath) / f"{session}.json"
-    if not path.exists(): return []
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ---------- util: config ----------
+def _ensure_dir():
+    Path(BASE_DIR).mkdir(parents=True, exist_ok=True)
 
-def save_history(dirpath, session, history):
-    Path(dirpath).mkdir(parents=True, exist_ok=True)
-    path = Path(dirpath) / f"{session}.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+def get_default_session():
+    _ensure_dir()
+    if CONFIG.exists():
+        try:
+            cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+            return cfg.get("default_session", "default")
+        except Exception:
+            return "default"
+    return "default"
 
+def set_default_session(name: str):
+    _ensure_dir()
+    cfg = {}
+    if CONFIG.exists():
+        try:
+            cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    cfg["default_session"] = name
+    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# ---------- util: history ----------
+def hist_path(session: str) -> Path:
+    return Path(BASE_DIR) / f"{session}.json"
+
+def load_history(session: str):
+    p = hist_path(session)
+    if not p.exists(): return []
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+def save_history(session: str, history):
+    _ensure_dir()
+    hist_path(session).write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def list_sessions():
+    _ensure_dir()
+    rows = []
+    for fp in sorted(glob.glob(str(Path(BASE_DIR) / "*.json"))):
+        session = Path(fp).stem
+        try:
+            hist = json.loads(Path(fp).read_text(encoding="utf-8"))
+            n = len(hist)
+        except Exception:
+            n = -1
+        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fp))
+        rows.append((session, n, mtime))
+    return rows
+
+def print_sessions(rows, default_name):
+    if not rows:
+        print("(スレッドがありません) まずは質問して履歴を作成してください。")
+        return
+    print("セッション名\tメッセージ数\t最終更新\t(★=デフォルト)")
+    for s, n, mt in rows:
+        star = "★" if s == default_name else ""
+        print(f"{s}\t{n}\t{mt.strftime('%Y-%m-%d %H:%M:%S')}\t{star}")
+
+# ---------- export ----------
+def to_markdown(history, session):
+    lines = [f"# Session: {session}", ""]
+    for m in history:
+        role = m.get("role","?")
+        ts = m.get("ts")
+        if ts:
+            dt = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            header = f"## {role} @ {dt}"
+        else:
+            header = f"## {role}"
+        content = m.get("content","")
+        if isinstance(content, list):  # {type:"text", text:"..."} の配列を想定
+            content = "".join(x.get("text","") for x in content if isinstance(x, dict))
+        lines.append(header)
+        lines.append("")
+        lines.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+def export_history(session, fmt, out_path=None, role="all", last=None):
+    hist = load_history(session)
+    if role in ("user","assistant"):
+        hist = [m for m in hist if m.get("role")==role]
+    if last and last>0:
+        hist = hist[-last:]
+    if fmt == "markdown":
+        data = to_markdown(hist, session)
+    elif fmt == "json":
+        data = json.dumps(hist, ensure_ascii=False, indent=2)
+    else:
+        raise ValueError("unsupported export format")
+    if out_path:
+        Path(out_path).write_text(data, encoding="utf-8")
+        print(f"exported -> {out_path}")
+    else:
+        print(data)
+
+# ---------- grep ----------
+def grep_sessions(pattern, session=None, all_sessions=False, role="all", ignore_case=False, last=None):
+    flags = re.IGNORECASE if ignore_case else 0
+    prog = re.compile(pattern, flags)
+    targets = []
+    if all_sessions:
+        targets = [s for s,_,_ in list_sessions()]
+    else:
+        targets = [session or get_default_session()]
+    hits = []
+    for s in targets:
+        hist = load_history(s)
+        if role in ("user","assistant"):
+            hist = [m for m in hist if m.get("role")==role]
+        if last and last>0:
+            hist = hist[-last:]
+        for idx, m in enumerate(hist, 1):
+            c = m.get("content","")
+            if isinstance(c, list):
+                c = "".join(x.get("text","") for x in c if isinstance(x, dict))
+            if not isinstance(c, str):
+                c = json.dumps(c, ensure_ascii=False)
+            if prog.search(c):
+                ts = m.get("ts")
+                stamp = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
+                hits.append((s, idx, m.get("role","?"), stamp, c))
+    return hits
+
+def print_grep_results(hits):
+    if not hits:
+        print("(一致なし)")
+        return
+    for (sess, idx, role, ts, text) in hits:
+        print(f"[{sess}] #{idx} {role} @ {ts}\n{text}\n")
+
+# ---------- API ----------
 def make_payload(history, prompt, use_search=True):
-    # Responses APIは input に履歴＋新規発話を渡せる
     msgs = history + [{"role": "user", "content": prompt}]
-    payload = {
-        "model": MODEL,
-        "input": msgs,
-    }
+    payload = {"model": MODEL, "input": msgs}
     if use_search:
-        payload["tools"] = [{"type": "web_search"}]
+        payload["tools"] = [{"type":"web_search"}]
     return payload
 
 def call_api(payload, api_key):
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     resp = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=300)
     if resp.status_code != 200:
         raise RuntimeError(f"API error {resp.status_code}: {resp.text}")
     return resp.json()
 
 def extract_text(resp_json):
-    # SDKと同様のヘルパが無いので素直に辿る（output_textがあれば最優先）
-    if "output_text" in resp_json and resp_json["output_text"]:
+    if resp_json.get("output_text"):
         return resp_json["output_text"]
-    # 汎用フォールバック
-    try:
-        items = resp_json.get("output", []) or resp_json.get("response", {}).get("output", [])
-        for it in items:
-            if it.get("type") == "message":
-                for c in it.get("content", []):
-                    if c.get("type") == "output_text":
-                        return c.get("text", "")
-        # だめなら最終手段
-        return json.dumps(resp_json)
-    except Exception:
-        return json.dumps(resp_json)
+    items = resp_json.get("output", []) or resp_json.get("response", {}).get("output", [])
+    chunks = []
+    for it in items:
+        if it.get("type") == "message":
+            for c in it.get("content", []):
+                if c.get("type") in ("output_text","text") and "text" in c:
+                    chunks.append(c["text"])
+    if chunks:
+        return "".join(chunks)
+    choices = resp_json.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = choices[0].get("message", {})
+        cont = msg.get("content")
+        if isinstance(cont, str): return cont
+        if isinstance(cont, list):
+            return "".join(x.get("text","") for x in cont if isinstance(x, dict))
+    return ""
 
+# ---------- main ----------
 def main():
-    p = argparse.ArgumentParser(description="GPT-5 CLI with Web Search + history")
-    p.add_argument("prompt", nargs="*", help="質問/指示。未指定なら標準入力から")
-    p.add_argument("--session", "-s", default="default", help="履歴ファイル名")
-    p.add_argument("--history-dir", default=os.path.expanduser("~/.gpt5_cli"))
-    p.add_argument("--no-search", action="store_true", help="Web検索を無効化")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description="GPT-5 CLI (history, web_search, list/show/export/grep, default session)")
+    # 通常質問
+    ap.add_argument("prompt", nargs="*", help="質問/指示。未指定なら標準入力から")
+    ap.add_argument("--session", "-s", help="履歴ファイル名（スレッド名）。未指定時はデフォルトセッションを使用")
+    ap.add_argument("--no-search", action="store_true", help="Web検索を無効化")
 
+    # 一覧/表示
+    ap.add_argument("--list", action="store_true", help="スレッド一覧を表示")
+    ap.add_argument("--show", action="store_true", help="このセッション（またはデフォルト）の履歴を表示")
+    ap.add_argument("--last", type=int, help="--show/--export/--grep時: 末尾N件だけ")
+    ap.add_argument("--role", choices=["all","user","assistant"], default="all", help="--show/--export/--grepのロール絞り込み")
+
+    # エクスポート
+    ap.add_argument("--export", choices=["markdown","json"], help="履歴を指定フォーマットで出力")
+    ap.add_argument("--out", help="--export時の出力先ファイル。未指定なら標準出力")
+
+    # grep
+    ap.add_argument("--grep", help="履歴内を正規表現で検索")
+    ap.add_argument("--all", action="store_true", help="--grep時: 全スレッド横断で検索")
+    ap.add_argument("--ignore-case", "-i", action="store_true", help="--grep時: 大文字小文字を無視")
+
+    # デフォルトスレッド
+    ap.add_argument("--set-thread", metavar="SESSION", help="デフォルトセッションを設定")
+    ap.add_argument("--get-thread", action="store_true", help="現在のデフォルトセッションを表示")
+
+    args = ap.parse_args()
+
+    # デフォルト関連
+    if args.get_default:
+        print(get_default_session()); return
+    if args.set_default:
+        set_default_session(args.set_default)
+        print(f"default session -> {args.set_default}")
+        return
+
+    # 一覧
+    if args.list:
+        print_sessions(list_sessions(), get_default_session())
+        return
+
+    # ターゲットセッションを決定
+    session = args.session or get_default_session()
+
+    # 表示
+    if args.show and not args.export and not args.grep:
+        hist = load_history(session)
+        if args.role in ("user","assistant"):
+            hist = [m for m in hist if m.get("role")==args.role]
+        if args.last and args.last>0:
+            hist = hist[-args.last:]
+        if not hist:
+            print(f"(セッション '{session}' の履歴はありません)")
+            return
+        for i, m in enumerate(hist, 1):
+            r = m.get("role","?")
+            c = m.get("content","")
+            if isinstance(c, list):
+                c = "".join(x.get("text","") for x in c if isinstance(x, dict))
+            print(f"[{i}] {r}:\n{c}\n")
+        return
+
+    # エクスポート
+    if args.export:
+        export_history(session, args.export, out_path=args.out, role=args.role, last=args.last)
+        return
+
+    # grep
+    if args.grep:
+        hits = grep_sessions(args.grep, session=session, all_sessions=args.all,
+                             role=args.role, ignore_case=args.ignore_case, last=args.last)
+        print_grep_results(hits)
+        return
+
+    # ---- 通常問い合わせ ----
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print("ERROR: OPENAI_API_KEY が未設定です。export OPENAI_API_KEY=... を実行してください。", file=sys.stderr)
@@ -77,19 +279,18 @@ def main():
     if not prompt:
         print("空のプロンプトです。", file=sys.stderr); sys.exit(1)
 
-    # 履歴読込→API→結果→履歴保存
-    history = load_history(args.history_dir, args.session)
+    history = load_history(session)
     payload = make_payload(history, prompt, use_search=(not args.no_search))
     resp = call_api(payload, api_key)
-    text = extract_text(resp)
+    text = extract_text(resp) or "(no text)"
 
-    # 出力
     print(text.strip())
 
-    # 履歴更新（ユーザー発話＋アシスタント返答）
-    history.append({"role": "user", "content": prompt})
-    history.append({"role": "assistant", "content": text})
-    save_history(args.history_dir, args.session, history)
+    now_ts = int(time.time())
+    history.append({"role": "user", "content": prompt, "ts": now_ts})
+    history.append({"role": "assistant", "content": text, "ts": now_ts})
+    save_history(session, history)
 
 if __name__ == "__main__":
+    # シェバンより前の空行NG / 改行はLF
     main()
