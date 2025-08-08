@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [{email = "tower2149.aic@gmail.com"}]
+dependencies = [
+	"requests",
+	"chardet"
+]
 
 # インストール時に作られる実行ファイル名 → gpt
 [project.scripts]
