@@ -492,7 +492,16 @@ def call_api(payload, api_key, local_paths=None):
 
 # ===== CLI =====
 def main():
-    ap = argparse.ArgumentParser(description="GPT-5 CLI (history, web_search, list/show/export/grep, default session, auto file routing + fallback)")
+    ap = argparse.ArgumentParser(
+        prog="gpt",
+        description="ChatGPT CLI",
+        usage="%(prog)s PROMPT... [OPTIONS]",
+        epilog=(
+            "注意:  OPTIONSの後にPROMPTを置く場合は、-- で区切ってください。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
     # 通常
     ap.add_argument("prompt", nargs="*", help="質問/指示。未指定なら標準入力から")
     ap.add_argument("--session", "-s", help="履歴名（スレッド）。未指定はデフォルト")
