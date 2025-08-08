@@ -33,6 +33,9 @@ import argparse, json, os, sys, time, glob, datetime, re, mimetypes, subprocess,
 from pathlib import Path
 import requests
 import chardet
+import secrets, time
+from pathlib import Path
+
 
 # ===== 基本設定 =====
 API_URL   = "https://api.openai.com/v1/responses"
@@ -247,30 +250,47 @@ def _pick_installed_font():
         pass
     return None
 
-def convert_to_pdf(src_path: Path) -> Path | None:
-    """pandoc + lualatex + 日本語フォント自動。拡張子不明は -f markdown 付与"""
-    pdf_path = src_path.parent / (src_path.stem + ".pdf")
-    ext = src_path.suffix.lower()
-    known_md_ext = {".md",".markdown",".txt",".rst",".html",".htm"}
-    treat_as_md = (ext == "" or ext not in known_md_ext | {".docx",".odt"})
-
-    font = _pick_installed_font()
-    font_args = []
-    if font:
-        font_args = ["-V", f"mainfont={font}", "-V", f"CJKmainfont={font}"]
-
-    cmd = ["pandoc", str(src_path), "-o", str(pdf_path), "--pdf-engine=lualatex"] + font_args
-    if treat_as_md:
-        cmd += ["-f", "markdown"]
-
+def convert_to_pdf(src_path: Path, tmp_root: Path = Path("/tmp")) -> Path | None:
+    """PDFも含めて/tmp配下に隔離して出力。成功時は/tmp内のPDFパスを返す。"""
+    assert src_path.exists()
+    # /tmp/mytool-<epoch>-<rand> を 0700 で作成
+    outdir = tmp_root / f"mytool-{int(time.time())}-{secrets.token_hex(4)}"
+    outdir.mkdir(parents=True, exist_ok=False, mode=0o700)
     try:
-        subprocess.run(cmd, cwd=str(src_path.parent), check=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # フォント指定は任意（例: _pick_installed_font() がある前提なら使う）
+        font_args = []
+        # font = _pick_installed_font()
+        # if font:
+        #     font_args = ["-V", f"mainfont={font}", "-V", f"CJKmainfont={font}"]
+
+        pdf_path = outdir / (src_path.stem + ".pdf")
+        cmd = [
+            "pandoc", str(src_path),
+            "-o", str(pdf_path),
+            "--pdf-engine=lualatex",
+            "--resource-path", str(src_path.parent),
+            f"--pdf-engine-opt=-output-directory={outdir}",
+            # MiKTeX の場合は必要に応じて:
+            # f"--pdf-engine-opt=-aux-directory={outdir}",
+        ] + font_args
+
+        # 作業CWDも/tmp側にする（万一の追加ファイルもここへ）
+        subprocess.run(
+            cmd, cwd=str(outdir), check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+
+        if not pdf_path.exists():
+            sys.stderr.write(f"[warn] PDFが生成されませんでした: {src_path.name}\n")
+            return None
+
+        return pdf_path  # ここで返るのは /tmp/.../xxx.pdf
     except subprocess.CalledProcessError as e:
         sys.stderr.write(f"[warn] pandoc変換失敗: {src_path.name}\n{e.stderr.decode(errors='ignore')}\n")
         return None
-
-    return pdf_path if pdf_path.exists() else None
+    except Exception as e:
+        sys.stderr.write(f"[warn] 変換処理中に例外: {e}\n")
+        return None
 
 def upload_pdf_for_responses(pdf_path: Path, api_key) -> str | None:
     headers = {"Authorization": f"Bearer {api_key}"}
