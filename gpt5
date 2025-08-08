@@ -191,7 +191,7 @@ def upload_auto(paths, api_key):
         if not p.exists():
             print(f"[warn] file not found: {p}", file=sys.stderr); continue
         ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-        purpose = "responses" if _is_pdf_path(p) else "assistants"
+        purpose = "user_data" if _is_pdf_path(p) else "assistants"
         with open(p, "rb") as f:
             files = {"file": (p.name, f, ctype), "purpose": (None, purpose)}
             r = requests.post(FILES_URL, headers=headers, files=files, timeout=600)
@@ -218,7 +218,7 @@ def classify_existing_ids(ids, api_key):
         meta = file_info(fid, api_key)
         name = (meta.get("filename") or "").lower()
         purpose = meta.get("purpose", "")
-        if name.endswith(".pdf") or purpose == "responses":
+        if name.endswith(".pdf") or purpose == "user_data":
             pdf_ids.append(fid)
         else:
             rag_ids.append(fid)
@@ -271,6 +271,29 @@ def convert_to_pdf(src_path: Path) -> Path | None:
         return None
 
     return pdf_path if pdf_path.exists() else None
+
+def upload_pdf_for_responses(pdf_path: Path, api_key) -> str | None:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    with open(pdf_path, "rb") as f:
+        files = {"file": (pdf_path.name, f, "application/pdf")}
+        data = {"purpose": "user_data"}
+        r = requests.post(FILES_URL, headers=headers, files=files, data=data, timeout=600)
+    if r.status_code != 200:
+        # フォールバック（user_dataが使えない環境）
+        if r.status_code == 400 and "purpose" in r.text:
+            with open(pdf_path, "rb") as f2:
+                files2 = {"file": (pdf_path.name, f2, "application/pdf")}
+                data2 = {"purpose": "assistants"}
+                r2 = requests.post(FILES_URL, headers=headers, files=files2, data=data2, timeout=600)
+            if r2.status_code != 200:
+                sys.stderr.write(f"[warn] PDFアップロード失敗: {pdf_path.name} -> {r2.status_code} {r2.text}\n")
+                return None
+            return r2.json().get("id")
+        else:
+            sys.stderr.write(f"[warn] PDFアップロード失敗: {pdf_path.name} -> {r.status_code} {r.text}\n")
+            return None
+    return r.json().get("id")
+
 
 def _read_text_safely(path: Path) -> str | None:
     """UTF-8優先、ダメなら chardet 推測で読む"""
