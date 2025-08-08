@@ -1,26 +1,61 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gpt5: WSL向け GPT-5 CLI
-- Web検索統合（tools:web_search）
-- 履歴保存（擬似スレッド）
-- スレッド一覧/履歴表示
-- 追加: エクスポート(--export markdown/json), grep(--grep)
-- 追加: デフォルトスレッド(--set-default/--get-default)
-- 追加: ファイルアップロード(--upload)と既存ファイル添付(--attach)
+GPT-5 CLI 改良版（WSL向け・単体ファイル）
+- 履歴/擬似スレッド保存（~/.gpt5_cli/<session>.json）
+- スレッド一覧 (--list) / 履歴表示 (--show) / エクスポート (--export markdown|json) / grep 検索 (--grep)
+- デフォルトスレッド切替 (--set-default / --get-default)
+- Web検索統合（デフォルトON、--no-search で切替）
+- ファイル添付:
+    * --upload <ローカルファイル...>  → 自動振り分け
+        - .pdf は Responses の input_file 直添付（purpose=responses）
+        - 非 .pdf は File Search（RAG）として添付（purpose=assistants）
+    * --attach <file_id...> → 既存IDを自動判別して添付
+- 互換フォールバック（組織/プランで attachments 未対応な場合）:
+    1) RAGファイルを取得（ローカル再利用 or /v1/files/{id}/content）
+    2) pandoc + lualatex + 日本語フォント自動で PDF 化 → responses に再アップ
+    3) それも無理なら、ファイル内容を ``` で囲んだ input_text として**直接埋め込み**
+- 依存:
+    sudo apt-get update
+    sudo apt-get install -y pandoc texlive-luatex texlive-lang-japanese fonts-noto-cjk fonts-ipafont
+    pip install requests chardet
+- 使い方例:
+    ./gpt "続き。前提を踏まえて要約を3点で"
+    ./gpt --list
+    ./gpt --show --last 10 --role assistant
+    ./gpt --set-default projA
+    ./gpt --upload report.pdf notes.md "両方参照して要点を"
+    ./gpt --attach file_abc file_def "2つの資料を比較して"
+    ./gpt --export markdown --out sess.md
 """
 
-import argparse, json, os, sys, time, glob, datetime, re
-import requests
+import argparse, json, os, sys, time, glob, datetime, re, mimetypes, subprocess, tempfile
 from pathlib import Path
+import requests
+import chardet
 
-API_URL = "https://api.openai.com/v1/responses"
+# ===== 基本設定 =====
+API_URL   = "https://api.openai.com/v1/responses"
 FILES_URL = "https://api.openai.com/v1/files"
-MODEL   = "gpt-5"   # gpt-5 / gpt-5-mini など
-BASE_DIR = os.path.expanduser("~/.gpt5_cli")
-CONFIG   = Path(BASE_DIR) / "config.json"
+MODEL     = "gpt-5"  # gpt-5 / gpt-5-mini など
+BASE_DIR  = os.path.expanduser("~/.gpt5_cli")
+CONFIG    = Path(BASE_DIR) / "config.json"
 
-# ---------- util: config ----------
+# ===== フォールバック・変換関連 =====
+MAX_CHARS_PER_CHUNK = 12000
+TEXT_LIKE_EXT = {
+    ".md",".markdown",".txt",".rst",".log",".cfg",".ini",".yaml",".yml",".json",".csv",".tsv",
+    ".html",".htm",".tex",".py",".js",".ts",".java",".go",".rb",".rs",".c",".cpp",".sh",".bat",
+    ".ps1",".sql",".toml",".xml",".css"
+}
+FONT_CANDIDATES = [
+    "Noto Sans CJK JP",
+    "Noto Serif CJK JP",
+    "IPAexGothic",
+    "IPAexMincho",
+]
+
+# ===== 共通ユーティリティ =====
 def _ensure_dir():
     Path(BASE_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -28,24 +63,20 @@ def get_default_session():
     _ensure_dir()
     if CONFIG.exists():
         try:
-            cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-            return cfg.get("default_session", "default")
+            return json.loads(CONFIG.read_text(encoding="utf-8")).get("default_session", "default")
         except Exception:
             return "default"
     return "default"
 
 def set_default_session(name: str):
     _ensure_dir()
-    cfg = {}
-    if CONFIG.exists():
-        try:
-            cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-        except Exception:
-            cfg = {}
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8")) if CONFIG.exists() else {}
+    except Exception:
+        cfg = {}
     cfg["default_session"] = name
     CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# ---------- util: history ----------
 def hist_path(session: str) -> Path:
     return Path(BASE_DIR) / f"{session}.json"
 
@@ -84,27 +115,29 @@ def print_sessions(rows, default_name):
         star = "★" if s == default_name else ""
         print(f"{s}\t{n}\t{mt.strftime('%Y-%m-%d %H:%M:%S')}\t{star}")
 
-# ---------- export ----------
+def _content_to_text(content):
+    if isinstance(content, list):
+        return "".join(x.get("text","") for x in content if isinstance(x, dict))
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False)
+    if isinstance(content, str):
+        return content
+    return ""
+
 def to_markdown(history, session):
     lines = [f"# Session: {session}", ""]
     for m in history:
         role = m.get("role","?")
         ts = m.get("ts")
-        if ts:
-            dt = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-            header = f"## {role} @ {dt}"
-        else:
-            header = f"## {role}"
-        content = m.get("content","")
-        if isinstance(content, list):  # {type:"text", text:"..."} の配列を想定
-            content = "".join(x.get("text","") for x in content if isinstance(x, dict))
-        lines.append(header)
-        lines.append("")
-        lines.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
-        # 添付メタ表示
-        if m.get("files"):
+        header = f"## {role} @ {datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}" if ts else f"## {role}"
+        lines.append(header); lines.append("")
+        lines.append(_content_to_text(m.get("content","")))
+        meta = []
+        if m.get("files_pdf"): meta.append("pdf=" + ",".join(m["files_pdf"]))
+        if m.get("files_rag"): meta.append("rag=" + ",".join(m["files_rag"]))
+        if meta:
             lines.append("")
-            lines.append(f"> attached files: {', '.join(m['files'])}")
+            lines.append(f"> attached: {' | '.join(meta)}")
         lines.append("")
     return "\n".join(lines).strip() + "\n"
 
@@ -114,27 +147,16 @@ def export_history(session, fmt, out_path=None, role="all", last=None):
         hist = [m for m in hist if m.get("role")==role]
     if last and last>0:
         hist = hist[-last:]
-    if fmt == "markdown":
-        data = to_markdown(hist, session)
-    elif fmt == "json":
-        data = json.dumps(hist, ensure_ascii=False, indent=2)
-    else:
-        raise ValueError("unsupported export format")
+    data = to_markdown(hist, session) if fmt=="markdown" else json.dumps(hist, ensure_ascii=False, indent=2)
     if out_path:
-        Path(out_path).write_text(data, encoding="utf-8")
-        print(f"exported -> {out_path}")
+        Path(out_path).write_text(data, encoding="utf-8"); print(f"exported -> {out_path}")
     else:
         print(data)
 
-# ---------- grep ----------
 def grep_sessions(pattern, session=None, all_sessions=False, role="all", ignore_case=False, last=None):
     flags = re.IGNORECASE if ignore_case else 0
     prog = re.compile(pattern, flags)
-    targets = []
-    if all_sessions:
-        targets = [s for s,_,_ in list_sessions()]
-    else:
-        targets = [session or get_default_session()]
+    targets = [s for s,_,_ in list_sessions()] if all_sessions else [session or get_default_session()]
     hits = []
     for s in targets:
         hist = load_history(s)
@@ -143,11 +165,7 @@ def grep_sessions(pattern, session=None, all_sessions=False, role="all", ignore_
         if last and last>0:
             hist = hist[-last:]
         for idx, m in enumerate(hist, 1):
-            c = m.get("content","")
-            if isinstance(c, list):
-                c = "".join(x.get("text","") for x in c if isinstance(x, dict))
-            if not isinstance(c, str):
-                c = json.dumps(c, ensure_ascii=False)
+            c = _content_to_text(m.get("content",""))
             if prog.search(c):
                 ts = m.get("ts")
                 stamp = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
@@ -156,93 +174,175 @@ def grep_sessions(pattern, session=None, all_sessions=False, role="all", ignore_
 
 def print_grep_results(hits):
     if not hits:
-        print("(一致なし)")
-        return
+        print("(一致なし)"); return
     for (sess, idx, role, ts, text) in hits:
         print(f"[{sess}] #{idx} {role} @ {ts}\n{text}\n")
 
-# ---------- files API ----------
-def upload_files(paths, api_key, purpose="responses"):
-    """複数パスを /v1/files にアップロードし、file_id の配列を返す"""
-    ids = []
+# ===== Files API =====
+def _is_pdf_path(path: Path) -> bool:
+    return path.suffix.lower() == ".pdf"
+
+def upload_auto(paths, api_key):
+    """ローカルファイルを自動振り分けでアップロード。戻り値: (pdf_ids, rag_ids, id2local)"""
+    pdf_ids, rag_ids, id2local = [], [], {}
     headers = {"Authorization": f"Bearer {api_key}"}
-    for path in paths:
-        p = Path(path)
+    for p_str in paths:
+        p = Path(p_str)
         if not p.exists():
-            print(f"[warn] file not found: {path}", file=sys.stderr)
-            continue
+            print(f"[warn] file not found: {p}", file=sys.stderr); continue
+        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        purpose = "responses" if _is_pdf_path(p) else "assistants"
         with open(p, "rb") as f:
-            files = {
-                "file": (p.name, f),
-                "purpose": (None, purpose),
-            }
-            r = requests.post(
-                FILES_URL,
-                headers=headers,
-                data={"purpose": purpose},      # ← フォームフィールド
-                files={"file": (p.name, f)},    # ← バイナリ
-                timeout=600
-            )
-            if r.status_code != 200:
-                print(f"[error] upload failed: {p} -> {r.status_code} {r.text}", file=sys.stderr)
-                continue
-            j = r.json()
-            fid = j.get("id")
-            if fid:
-                ids.append(fid)
-                print(f"[uploaded] {p} -> {fid}")
-            else:
-                print(f"[warn] no id in response for {p}", file=sys.stderr)
-    return ids
+            files = {"file": (p.name, f, ctype), "purpose": (None, purpose)}
+            r = requests.post(FILES_URL, headers=headers, files=files, timeout=600)
+        if r.status_code != 200:
+            print(f"[error] upload failed: {p} -> {r.status_code} {r.text}", file=sys.stderr); continue
+        j = r.json(); fid = j.get("id")
+        if not fid:
+            print(f"[warn] no id in response for {p}", file=sys.stderr); continue
+        id2local[fid] = str(p)
+        if _is_pdf_path(p):
+            pdf_ids.append(fid); print(f"[uploaded/pdf]  {p.name} -> {fid}")
+        else:
+            rag_ids.append(fid); print(f"[uploaded/rag]  {p.name} -> {fid}")
+    return pdf_ids, rag_ids, id2local
 
-# ---------- API ----------
-def build_user_content(prompt, file_ids):
-    """content（ユーザー発話）を、ファイル添付の有無で作り分け"""
-    if file_ids:
-        content = [{"type":"input_text","text": prompt}]
-        for fid in file_ids:
-            content.append({"type":"input_file","file_id": fid})
-        return content  # list
-    else:
-        return prompt    # str
+def file_info(file_id, api_key):
+    headers = {"Authorization": f"Bearer {api_key}"}
+    r = requests.get(f"{FILES_URL}/{file_id}", headers=headers, timeout=60)
+    return r.json() if r.status_code==200 else {}
 
-def _to_api_message(m):
-    role = m.get("role", "user")
-    content = m.get("content", "")
-    # content は str か、[{type:"text",text:"..."}, {type:"input_file",file_id:"..."}] のいずれか
-    # 保存用に付けた files/ts などは送らない
-    return {"role": role, "content": content}
+def classify_existing_ids(ids, api_key):
+    pdf_ids, rag_ids = [], []
+    for fid in ids:
+        meta = file_info(fid, api_key)
+        name = (meta.get("filename") or "").lower()
+        purpose = meta.get("purpose", "")
+        if name.endswith(".pdf") or purpose == "responses":
+            pdf_ids.append(fid)
+        else:
+            rag_ids.append(fid)
+    return pdf_ids, rag_ids
 
-def sanitize_history_for_api(history):
-    api_msgs = []
+def download_file_content(file_id, api_key, out_dir):
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = f"{FILES_URL}/{file_id}/content"
+    r = requests.get(url, headers=headers, stream=True, timeout=600)
+    r.raise_for_status()
+    name = r.headers.get("x-file-name") or f"{file_id}"
+    dst = Path(out_dir) / name
+    with open(dst, "wb") as f:
+        for chunk in r.iter_content(1024*1024):
+            if chunk: f.write(chunk)
+    return dst
+
+def _pick_installed_font():
+    try:
+        out = subprocess.run(["fc-list", ":family"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        fam = out.stdout.decode(errors="ignore")
+        for name in FONT_CANDIDATES:
+            if name in fam:
+                return name
+    except Exception:
+        pass
+    return None
+
+def convert_to_pdf(src_path: Path) -> Path | None:
+    """pandoc + lualatex + 日本語フォント自動。拡張子不明は -f markdown 付与"""
+    pdf_path = src_path.parent / (src_path.stem + ".pdf")
+    ext = src_path.suffix.lower()
+    known_md_ext = {".md",".markdown",".txt",".rst",".html",".htm"}
+    treat_as_md = (ext == "" or ext not in known_md_ext | {".docx",".odt"})
+
+    font = _pick_installed_font()
+    font_args = []
+    if font:
+        font_args = ["-V", f"mainfont={font}", "-V", f"CJKmainfont={font}"]
+
+    cmd = ["pandoc", str(src_path), "-o", str(pdf_path), "--pdf-engine=lualatex"] + font_args
+    if treat_as_md:
+        cmd += ["-f", "markdown"]
+
+    try:
+        subprocess.run(cmd, cwd=str(src_path.parent), check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write(f"[warn] pandoc変換失敗: {src_path.name}\n{e.stderr.decode(errors='ignore')}\n")
+        return None
+
+    return pdf_path if pdf_path.exists() else None
+
+def _read_text_safely(path: Path) -> str | None:
+    """UTF-8優先、ダメなら chardet 推測で読む"""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        try:
+            raw = path.read_bytes()
+        except Exception:
+            return None
+        try:
+            enc = chardet.detect(raw).get("encoding") or "utf-8"
+        except Exception:
+            enc = "utf-8"
+        try:
+            return raw.decode(enc, errors="ignore")
+        except Exception:
+            return None
+
+def _chunk_text(s: str, size=MAX_CHARS_PER_CHUNK):
+    return [s[i:i+size] for i in range(0, len(s), size)]
+
+# ===== メッセージ整形 =====
+def sanitize_history(history):
+    """履歴の独自メタを落として API 仕様に整形"""
+    clean = []
     for m in history:
-        api_msgs.append(_to_api_message(m))
-    return api_msgs
+        if not isinstance(m, dict): continue
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            norm = []
+            for c in content:
+                if isinstance(c, dict):
+                    t = c.get("type")
+                    if t == "input_file" and "file_id" in c:
+                        norm.append({"type":"input_file","file_id":c["file_id"]})
+                    elif t in ("input_text","text") and "text" in c:
+                        norm.append({"type":"input_text","text":c["text"]})
+                    else:
+                        norm.append({"type":"input_text","text":json.dumps(c, ensure_ascii=False)})
+                elif isinstance(c, str):
+                    norm.append({"type":"input_text","text":c})
+            content = norm or ""
+        elif isinstance(content, dict):
+            content = json.dumps(content, ensure_ascii=False)
+        clean.append({"role": role, "content": content})
+    return clean
 
-def make_payload(history, prompt, use_search=True, file_ids=None):
-    # 履歴はサニタイズして送る
-    msgs = sanitize_history_for_api(history)
+def build_user_content(prompt, pdf_file_ids):
+    if pdf_file_ids:
+        content = [{"type":"input_text","text": prompt}]
+        for fid in pdf_file_ids:
+            content.append({"type":"input_file","file_id": fid})
+        return content
+    return prompt
 
-    # 今回のユーザー発話（添付ありなら input_file を並べる）
-    content = [{"type":"input_text","text": prompt}] if prompt else []
-    for fid in (file_ids or []):
-        content.append({"type":"input_file","file_id": fid})
-    if not content:
-        content = ""  # 本当に空なら空文字（ただし通常は何かテキストを推奨）
-
-    msgs.append({"role": "user", "content": content})
-
+def make_payload(history, prompt, use_search, pdf_ids, rag_ids):
+    msgs = sanitize_history(history)
+    user_msg = {"role":"user", "content": build_user_content(prompt, pdf_ids)}
+    msgs.append(user_msg)
     payload = {"model": MODEL, "input": msgs}
-    if use_search:
-        payload["tools"] = [{"type":"web_search"}]
-    return payload
 
-def call_api(payload, api_key):
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    resp = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=600)
-    if resp.status_code != 200:
-        raise RuntimeError(f"API error {resp.status_code}: {resp.text}")
-    return resp.json()
+    tools = []
+    if use_search:
+        tools.append({"type":"web_search"})
+    if rag_ids:
+        tools.append({"type":"file_search"})
+        payload["attachments"] = [{"file_id": fid, "tools":[{"type":"file_search"}]} for fid in rag_ids]
+    if tools:
+        payload["tools"] = tools
+    return payload
 
 def extract_text(resp_json):
     if resp_json.get("output_text"):
@@ -254,8 +354,7 @@ def extract_text(resp_json):
             for c in it.get("content", []):
                 if c.get("type") in ("output_text","text") and "text" in c:
                     chunks.append(c["text"])
-    if chunks:
-        return "".join(chunks)
+    if chunks: return "".join(chunks)
     choices = resp_json.get("choices")
     if isinstance(choices, list) and choices:
         msg = choices[0].get("message", {})
@@ -265,53 +364,127 @@ def extract_text(resp_json):
             return "".join(x.get("text","") for x in cont if isinstance(x, dict))
     return ""
 
-# ---------- main ----------
+def safe_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+# ===== APIコール（フォールバック込み） =====
+def call_api(payload, api_key, local_paths=None):
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    resp = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=600)
+    if resp.status_code == 200:
+        return resp.json()
+
+    j = safe_json(resp)
+    err = (j or {}).get("error", {})
+    if err.get("param") == "attachments":
+        sys.stderr.write("[info] attachments 未対応。互換モードに切替えます（非PDFをPDF化→直添付、失敗時はテキスト埋込）。\n")
+
+        rag_ids = [a.get("file_id") for a in payload.get("attachments", [])] if "attachments" in payload else []
+        payload.pop("attachments", None)
+        if "tools" in payload:
+            payload["tools"] = [t for t in payload["tools"] if t.get("type") != "file_search"]
+            if not payload["tools"]:
+                payload.pop("tools", None)
+
+        new_pdf_ids = []
+        inline_text_blocks = []
+
+        with tempfile.TemporaryDirectory() as td:
+            for fid in rag_ids:
+                src = Path(local_paths.get(fid)) if local_paths and fid in local_paths else None
+                if not src or not src.exists():
+                    try:
+                        src = download_file_content(fid, api_key, td)
+                    except Exception as e:
+                        sys.stderr.write(f"[warn] ダウンロード不可: {fid} ({e})\n")
+                        continue
+
+                pdf = convert_to_pdf(src)
+                if pdf:
+                    nid = upload_pdf_for_responses(pdf, api_key)
+                    if nid:
+                        new_pdf_ids.append(nid)
+                        sys.stderr.write(f"[compat/pdf] {src.name} -> {nid}\n")
+                    continue
+
+                text = None
+                if src.suffix.lower() in TEXT_LIKE_EXT or src.suffix == "":
+                    text = _read_text_safely(src)
+                if text:
+                    chunks = _chunk_text(text)
+                    header = f"【INLINE from {src.name}】\n"
+                    for i, chunk in enumerate(chunks):
+                        prefix = header if i == 0 else f"【INLINE cont. {src.name}】\n"
+                        fenced = f"```\n{chunk}\n```"
+                        inline_text_blocks.append(prefix + fenced)
+                    sys.stderr.write(f"[compat/inline] {src.name} をテキストとして直接埋め込みます（{len(chunks)}塊）\n")
+                else:
+                    sys.stderr.write(f"[warn] PDF化不可かつテキスト抽出失敗: {src.name}\n")
+
+        inputs = payload.get("input", [])
+        if inputs and isinstance(inputs[-1], dict) and inputs[-1].get("role") == "user":
+            content = inputs[-1].get("content")
+            if isinstance(content, str):
+                content = [{"type":"input_text","text":content}]
+            inputs[-1]["content"] = content
+        else:
+            content = [{"type":"input_text","text":"添付資料を参照して回答してください。"}]
+            inputs.append({"role":"user","content":content})
+            payload["input"] = inputs
+
+        for np in new_pdf_ids:
+            content.append({"type":"input_file","file_id":np})
+        for block in inline_text_blocks:
+            content.append({"type":"input_text","text":block})
+
+        resp2 = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=600)
+        if resp2.status_code != 200:
+            raise RuntimeError(f"API error {resp2.status_code}: {resp2.text}")
+        return resp2.json()
+
+    raise RuntimeError(f"API error {resp.status_code}: {resp.text}")
+
+# ===== CLI =====
 def main():
-    ap = argparse.ArgumentParser(description="GPT-5 CLI (history, web_search, list/show/export/grep, default session, file upload)")
-    # 通常質問
+    ap = argparse.ArgumentParser(description="GPT-5 CLI (history, web_search, list/show/export/grep, default session, auto file routing + fallback)")
+    # 通常
     ap.add_argument("prompt", nargs="*", help="質問/指示。未指定なら標準入力から")
-    ap.add_argument("--session", "-s", help="履歴ファイル名（スレッド名）。未指定時はデフォルトセッションを使用")
+    ap.add_argument("--session", "-s", help="履歴名（スレッド）。未指定はデフォルト")
     ap.add_argument("--no-search", action="store_true", help="Web検索を無効化")
 
-    # 一覧/表示
-    ap.add_argument("--list", action="store_true", help="スレッド一覧を表示", default=False)
-    ap.add_argument("--show", action="store_true", help="このセッション（またはデフォルト）の履歴を表示")
-    ap.add_argument("--last", type=int, help="--show/--export/--grep時: 末尾N件だけ")
-    ap.add_argument("--role", choices=["all","user","assistant"], default="all", help="--show/--export/--grepのロール絞り込み")
-
-    # エクスポート
-    ap.add_argument("--export", choices=["markdown","json"], help="履歴を指定フォーマットで出力")
-    ap.add_argument("--out", help="--export時の出力先ファイル。未指定なら標準出力")
-
-    # grep
+    # 一覧/表示/エクスポート/grep/デフォルト
+    ap.add_argument("--list", action="store_true", help="スレッド一覧")
+    ap.add_argument("--show", action="store_true", help="このセッションの履歴表示")
+    ap.add_argument("--last", type=int, help="--show/--export/--grep: 末尾N件")
+    ap.add_argument("--role", choices=["all","user","assistant"], default="all", help="--show/--export/--grep ロール絞り込み")
+    ap.add_argument("--export", choices=["markdown","json"], help="履歴を出力")
+    ap.add_argument("--out", help="--export の出力先ファイル")
     ap.add_argument("--grep", help="履歴内を正規表現で検索")
-    ap.add_argument("--all", action="store_true", help="--grep時: 全スレッド横断で検索")
-    ap.add_argument("--ignore-case", "-i", action="store_true", help="--grep時: 大文字小文字を無視")
-
-    # デフォルトスレッド
+    ap.add_argument("--all", action="store_true", help="--grep: 全スレッド横断")
+    ap.add_argument("--ignore-case", "-i", action="store_true", help="--grep: 大文字小文字無視")
     ap.add_argument("--set-default", metavar="SESSION", help="デフォルトセッションを設定")
     ap.add_argument("--get-default", action="store_true", help="現在のデフォルトセッションを表示")
 
-    # ファイルアップロード/添付
-    ap.add_argument("--upload", nargs="+", help="ローカルファイルを /v1/files にアップロードして添付")
-    ap.add_argument("--attach", nargs="+", help="既存の file_id を直接添付（スペース区切りで複数可）")
+    # ファイル（既存APIのまま）
+    ap.add_argument("--upload", nargs="+", help="ローカルファイルをアップロード（PDFは直添付、非PDFはRAG）")
+    ap.add_argument("--attach", nargs="+", help="既存 file_id を添付（自動判別）")
 
     args = ap.parse_args()
 
-    # デフォルト関連
+    # デフォルトセッション操作
     if args.get_default:
         print(get_default_session()); return
     if args.set_default:
-        set_default_session(args.set_default)
-        print(f"default session -> {args.set_default}")
-        return
+        set_default_session(args.set_default); print(f"default session -> {args.set_default}"); return
 
     # 一覧
     if args.list:
-        print_sessions(list_sessions(), get_default_session())
-        return
+        print_sessions(list_sessions(), get_default_session()); return
 
-    # ターゲットセッションを決定
+    # セッション決定
     session = args.session or get_default_session()
 
     # 表示
@@ -322,62 +495,59 @@ def main():
         if args.last and args.last>0:
             hist = hist[-args.last:]
         if not hist:
-            print(f"(セッション '{session}' の履歴はありません)")
-            return
+            print(f"(セッション '{session}' の履歴はありません)"); return
         for i, m in enumerate(hist, 1):
-            r = m.get("role","?")
-            c = m.get("content","")
-            if isinstance(c, list):
-                c = "".join(x.get("text","") for x in c if isinstance(x, dict))
+            r = m.get("role","?"); c = _content_to_text(m.get("content",""))
             print(f"[{i}] {r}:\n{c}")
-            if m.get("files"):
-                print(f"(attached: {', '.join(m['files'])})")
+            meta = []
+            if m.get("files_pdf"): meta.append("pdf=" + ",".join(m["files_pdf"]))
+            if m.get("files_rag"): meta.append("rag=" + ",".join(m["files_rag"]))
+            if meta: print(f"(attached: {' | '.join(meta)})")
             print()
         return
 
     # エクスポート
     if args.export:
-        export_history(session, args.export, out_path=args.out, role=args.role, last=args.last)
-        return
+        export_history(session, args.export, out_path=args.out, role=args.role, last=args.last); return
 
     # grep
     if args.grep:
         hits = grep_sessions(args.grep, session=session, all_sessions=args.all,
                              role=args.role, ignore_case=args.ignore_case, last=args.last)
-        print_grep_results(hits)
-        return
+        print_grep_results(hits); return
 
     # ---- 通常問い合わせ ----
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        print("ERROR: OPENAI_API_KEY が未設定です。export OPENAI_API_KEY=... を実行してください。", file=sys.stderr)
-        sys.exit(1)
+        print("ERROR: OPENAI_API_KEY が未設定です。export OPENAI_API_KEY=... を実行してください。", file=sys.stderr); sys.exit(1)
 
-    # 入力取得
+    # 入力
     if args.prompt:
         prompt = " ".join(args.prompt)
     else:
         prompt = sys.stdin.read().strip()
     if not prompt and not args.upload and not args.attach:
-        print("空のプロンプトです（ファイルだけ投げる場合は何かしらの指示文も推奨）", file=sys.stderr); sys.exit(1)
+        print("空のプロンプトです（ファイルだけ投げる場合でも簡単な指示文を推奨）", file=sys.stderr); sys.exit(1)
 
-    # アップロード → file_id
-    file_ids = []
+    # アップロード＆既存ID分類
+    pdf_ids, rag_ids, id2local = [], [], {}
     if args.upload:
-        file_ids.extend(upload_files(args.upload, api_key, purpose="user_data"))
+        p_pdf, p_rag, mapping = upload_auto(args.upload, api_key)
+        pdf_ids += p_pdf; rag_ids += p_rag; id2local.update(mapping)
     if args.attach:
-        file_ids.extend(args.attach)
+        a_pdf, a_rag = classify_existing_ids(args.attach, api_key)
+        pdf_ids += a_pdf; rag_ids += a_rag
 
     history = load_history(session)
-    payload = make_payload(history, prompt or "ファイルを解析してください。", use_search=(not args.no_search), file_ids=file_ids)
-    resp = call_api(payload, api_key)
-    text = extract_text(resp) or "(no text)"
+    payload = make_payload(history, prompt or "ファイルを参照して回答してください。", use_search=(not args.no_search),
+                           pdf_ids=pdf_ids, rag_ids=rag_ids)
 
+    resp = call_api(payload, api_key, local_paths=id2local)
+    text = extract_text(resp) or "(no text)"
     print(text.strip())
 
     now_ts = int(time.time())
-    # 履歴に、添付ファイルIDもメタとして保存
-    history.append({"role": "user", "content": (prompt or ""), "files": file_ids, "ts": now_ts})
+    history.append({"role": "user", "content": (prompt or ""), "files_pdf": pdf_ids, "files_rag": rag_ids, "ts": now_ts})
     history.append({"role": "assistant", "content": text, "ts": now_ts})
     save_history(session, history)
 
