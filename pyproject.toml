@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpt-cli"                # 配布名（PyPI 名）。パッケージ名と別でもOK
+version = "0.1.0"
+description = "ChatGPT CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = ""}]
+dependencies = [
+	"argparse",
+	"json",
+	"os",
+	"sys",
+	"time",
+	"glob",
+	"datetime",
+	"re",
+	"mimetypes",
+	"subprocess",
+	"tempfile",
+	"pathlib",
+	"requests",
+	"chardet",
+	"secrets",
+	"time",
+	"pathlib"
+]
+
+# インストール時に作られる実行ファイル名 → gpt
+[project.scripts]
+gpt = "gptcli.cli:main"

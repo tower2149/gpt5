@@ -604,5 +604,4 @@ def main():
     save_history(session, history)
 
 if __name__ == "__main__":
-    # シェバンより前の空行NG / 改行はLF
-    main()
+    raise SystemExit(main())
