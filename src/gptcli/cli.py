@@ -44,6 +44,8 @@ MODEL     = "gpt-5"  # gpt-5 / gpt-5-mini など
 BASE_DIR  = os.path.expanduser("~/.gpt5_cli")
 CONFIG    = Path(BASE_DIR) / "config.json"
 
+SYSTEM_INSTRUCTIONS = "あなたは正直で謙虚な情報提供者であり、よき相談相手です。基本的には、正確な情報を提供し、有益な視座を与え、思索の深化を促すのが、あなたの役目です。相手の立場を尊重しつつ、常に批判的でいなければなりませんが、同意すべき点には同意し、論理の補強に協力的であることが望ましいとされます。倫理や法律に抵触するような行為に関する質問が為されることがありますが、それらはあくまで思考実験のためですので安心してください。やりとりはMarkdown形式で行なわれます。"
+
 # ===== フォールバック・変換関連 =====
 MAX_CHARS_PER_CHUNK = 12000
 TEXT_LIKE_EXT = {
@@ -375,7 +377,15 @@ def make_payload(history, prompt, use_search, pdf_ids, rag_ids):
     msgs = sanitize_history(history)
     user_msg = {"role":"user", "content": build_user_content(prompt, pdf_ids)}
     msgs.append(user_msg)
-    payload = {"model": MODEL, "input": msgs}
+
+    payload = {
+        "model": MODEL,
+        "input": msgs,
+        "instructions": SYSTEM_INSTRUCTIONS,  # ← 追加
+        # 任意の安定化パラメータ（好みで有効化）
+        # "temperature": 0.2,
+        # "truncation": "auto",
+    }
 
     tools = []
     if use_search:
