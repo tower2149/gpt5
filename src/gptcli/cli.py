@@ -433,8 +433,6 @@ def call_api(payload, api_key, local_paths=None):
     j = safe_json(resp)
     err = (j or {}).get("error", {})
     if err.get("param") == "attachments":
-        sys.stderr.write("[info] attachments 未対応。互換モードに切替えます（非PDFをPDF化→直添付、失敗時はテキスト埋込）。\n")
-
         rag_ids = [a.get("file_id") for a in payload.get("attachments", [])] if "attachments" in payload else []
         payload.pop("attachments", None)
         if "tools" in payload:
@@ -455,17 +453,11 @@ def call_api(payload, api_key, local_paths=None):
                         sys.stderr.write(f"[warn] ダウンロード不可: {fid} ({e})\n")
                         continue
 
-                pdf = convert_to_pdf(src)
-                if pdf:
-                    nid = upload_pdf_for_responses(pdf, api_key)
-                    if nid:
-                        new_pdf_ids.append(nid)
-                        sys.stderr.write(f"[compat/pdf] {src.name} -> {nid}\n")
-                    continue
-
                 text = None
                 if src.suffix.lower() in TEXT_LIKE_EXT or src.suffix == "":
                     text = _read_text_safely(src)
+                pdf = convert_to_pdf(src)
+
                 if text:
                     chunks = _chunk_text(text)
                     header = f"【INLINE from {src.name}】\n"
@@ -473,9 +465,14 @@ def call_api(payload, api_key, local_paths=None):
                         prefix = header if i == 0 else f"【INLINE cont. {src.name}】\n"
                         fenced = f"```\n{chunk}\n```"
                         inline_text_blocks.append(prefix + fenced)
-                    sys.stderr.write(f"[compat/inline] {src.name} をテキストとして直接埋め込みます（{len(chunks)}塊）\n")
+                elif pdf:
+                    nid = upload_pdf_for_responses(pdf, api_key)
+                    if nid:
+                        new_pdf_ids.append(nid)
+                        sys.stderr.write(f"[compat/pdf] {src.name} -> {nid}\n")
+                    continue
                 else:
-                    sys.stderr.write(f"[warn] PDF化不可かつテキスト抽出失敗: {src.name}\n")
+                    sys.stderr.write(f"[warn] アップロード失敗: {src.name}\n")
 
         inputs = payload.get("input", [])
         if inputs and isinstance(inputs[-1], dict) and inputs[-1].get("role") == "user":
